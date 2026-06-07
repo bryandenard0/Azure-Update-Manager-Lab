@@ -1,0 +1,313 @@
+# Azure Update Manager Lab
+
+Patch management and compliance reporting for Windows Server on Azure — Azure Update Manager, automated assessment, maintenance windows, and JSON compliance reporting. Deployed with modular Terraform, validated with Azure CLI.
+
+---
+
+## What You'll Learn
+
+- Building modular Terraform infrastructure (4 independent modules)
+- Using Azure Policy to auto-enroll VMs into patch assessment at scale
+- Configuring a Maintenance Window — when patches run, what gets patched, reboot behavior
+- Understanding the difference between assessment and patching (they are separate operations)
+- Triggering on-demand patch assessments via the Azure CLI
+- Writing a compliance validation script that exports machine-readable JSON
+
+---
+
+## What This Lab Simulates
+
+Picture a security team that just got an alert: a critical vulnerability with a CVSS score of 9.8 was disclosed. They need to know — right now — which servers are missing the patch.
+
+This lab builds the infrastructure and tooling to answer that question:
+
+- A **Domain Controller (DC01)** — the identity backbone for the environment. All machines are domain-joined to `aumlab.local`.
+- Two **Member Servers (WS01, WS02)** — simulate production workloads that need to be assessed and patched on a schedule.
+- **Azure Policy** — automatically enrolls every VM in the resource group into periodic patch assessment. No manual enrollment per VM.
+- **Maintenance Configuration** — a weekly patch window (Friday 2 AM Eastern) targeting Critical, Security, and UpdateRollup patches only.
+- **Maintenance Assignments** — links the schedule to each VM. A VM that is assessed but not assigned will show compliance data but never receive automated patches.
+- **validate-lab.ps1** — triggers a live assessment on each VM and exports a compliance report as JSON, ready to feed a SIEM or ticketing system.
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                          Azure VNet                              │
+│                          10.0.0.0/16                             │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │                    Subnet: 10.0.1.0/24                     │  │
+│  │                                                            │  │
+│  │   ┌──────────────┐   ┌──────────────┐   ┌─────────────┐   │  │
+│  │   │     DC01     │   │     WS01     │   │    WS02     │   │  │
+│  │   │   10.0.1.4   │   │  (dynamic)   │   │  (dynamic)  │   │  │
+│  │   │ Domain Ctrl  │   │ Member Server│   │Member Server│   │  │
+│  │   └──────────────┘   └──────────────┘   └─────────────┘   │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  ┌──────────────────────┐   ┌───────────────────────────────┐   │
+│  │   Azure Key Vault    │   │    Azure Storage Account      │   │
+│  │  (admin password)    │   │     (Terraform state)         │   │
+│  └──────────────────────┘   └───────────────────────────────┘   │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐   │
+│  │              Azure Update Manager                         │   │
+│  │  Azure Policy (auto-enroll) → Maintenance Config          │   │
+│  │  → 3 Maintenance Assignments → JSON Compliance Report     │   │
+│  └───────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+| VM   | Role              | OS                  | Private IP |
+|------|-------------------|---------------------|------------|
+| DC01 | Domain Controller | Windows Server 2022 | 10.0.1.4 (static) |
+| WS01 | Member Server     | Windows Server 2022 | Dynamic |
+| WS02 | Member Server     | Windows Server 2022 | Dynamic |
+
+- **Domain:** aumlab.local
+- **Region:** eastus
+- **VM Size:** Standard_D2s_v3
+
+> 💰 **Cost Estimate:** ~$0.17/hr for all three VMs. Run `terraform destroy -auto-approve` when finished to avoid unexpected charges. (~$4/day if left running)
+
+---
+
+## Module Structure
+
+This lab uses four independent Terraform modules — each owns exactly one concern:
+
+| Module | What it deploys |
+|--------|----------------|
+| `modules/networking` | VNet, subnet, NSG, NSG-subnet association |
+| `modules/keyvault` | Key Vault (RBAC model), admin password secret |
+| `modules/compute` | 3 VMs, DC promotion extension, domain join extensions |
+| `modules/update-manager` | Azure Policy assignment, Maintenance Configuration, 3 Maintenance Assignments |
+
+---
+
+## Prerequisites
+
+| Tool | Version | Install |
+|------|---------|---------|
+| Terraform | >= 1.5.0 | [Download](https://developer.hashicorp.com/terraform/downloads) |
+| Azure CLI | Latest | `winget install Microsoft.AzureCLI` |
+| PowerShell 7 | Latest | `winget install Microsoft.PowerShell` |
+| Active Azure subscription | — | [portal.azure.com](https://portal.azure.com) |
+
+**Register required Azure resource providers before deploying:**
+
+```powershell
+az provider register --namespace Microsoft.Maintenance
+az provider register --namespace Microsoft.GuestConfiguration
+
+# Wait until both show Registered
+az provider show --namespace Microsoft.Maintenance --query registrationState -o tsv
+az provider show --namespace Microsoft.GuestConfiguration --query registrationState -o tsv
+```
+
+---
+
+## Pre-Setup — Remote State Backend (One Time)
+
+Terraform keeps a record of everything it builds called a **state file**. This step stores it in Azure Blob Storage so it persists across machines and sessions.
+
+```powershell
+az group create --name RG-TerraformState --location eastus
+
+# Name must be globally unique, 3-24 lowercase chars + numbers only
+az storage account create `
+  --name <YOUR_UNIQUE_NAME> `
+  --resource-group RG-TerraformState `
+  --sku Standard_LRS
+
+az storage container create --name tfstate --account-name <YOUR_UNIQUE_NAME>
+```
+
+Then open `backend.tf` and replace `REPLACE_WITH_YOUR_STORAGE_ACCOUNT_NAME` with the name you chose.
+
+> **Note:** If you already have a `RG-TerraformState` storage account from Lab 1 or Lab 2, use the same one. Just set `key = "aum-lab.tfstate"` — it will not conflict with other labs.
+
+---
+
+## Step 1 — Configure Variables
+
+```powershell
+Copy-Item terraform.tfvars.example terraform.tfvars
+```
+
+Open `terraform.tfvars` and set your values:
+
+```hcl
+location            = "eastus"
+resource_group_name = "rg-aumlab"
+admin_username      = "labadmin"
+allowed_rdp_ip      = "YOUR_PUBLIC_IP/32"   # find at whatismyip.com
+domain_name         = "aumlab.local"
+domain_netbios      = "AUMLAB"
+```
+
+Open `modules/update-manager/main.tf` and update `start_date_time` to any future date:
+
+```hcl
+start_date_time = "2026-09-01 02:00"   # must be a future date — format: YYYY-MM-DD HH:MM
+```
+
+Set the admin password as an environment variable — it never touches disk:
+
+```powershell
+$env:TF_VAR_admin_password = "YourStrongPassword123!"
+
+# Verify it is set — if nothing prints, set it again before running plan
+echo $env:TF_VAR_admin_password
+```
+
+> **Why an environment variable?** Terraform automatically reads any `TF_VAR_*` environment variable as the matching input variable. The password exists in memory only — never written to a file, never in `terraform.tfvars`, and can never accidentally be committed to GitHub.
+
+> **Password requirements:** Min 12 characters. Must include uppercase, lowercase, a number, and a symbol.
+
+> ⚠️ **The password resets every time you open a new PowerShell session.** If you close and reopen the terminal, set it again before running `terraform plan` or `terraform apply`.
+
+---
+
+## Step 2 — Deploy Infrastructure
+
+```powershell
+az login
+az account show
+
+terraform init
+
+# Note: flags must be quoted on Windows PowerShell
+terraform plan -out="aum-lab.tfplan"
+
+# Takes 15-20 minutes — keep this window open the entire time
+terraform apply "aum-lab.tfplan"
+```
+
+After `terraform apply` completes you will see outputs like:
+
+```
+Outputs:
+
+dc01_public_ip = "20.x.x.x"
+ws01_public_ip = "20.x.x.x"
+ws02_public_ip = "20.x.x.x"
+key_vault_name = "kv-aum-4beef2e8"
+resource_group = "rg-aumlab"
+```
+
+> **What just got deployed:** 3 VMs joined to `aumlab.local`, a VNet with RDP locked to your IP, a Key Vault holding the admin password, an Azure Policy auto-enrolling all VMs into patch assessment, a weekly Maintenance Configuration, and Maintenance Assignments linking the schedule to each VM.
+
+> **If apply fails partway through:** Re-run `terraform apply "aum-lab.tfplan"`. Terraform skips what already succeeded and only retries what failed. Most errors are recoverable this way.
+
+---
+
+## Step 3 — Run Compliance Validation
+
+The validation script triggers a live patch assessment on each VM and exports a compliance report as JSON. No pre-triggering needed — `az vm assess-patches` does assessment and result retrieval in one call.
+
+```powershell
+$subId = az account show --query id -o tsv
+
+# Takes ~6-9 minutes (2-3 min per VM)
+./scripts/validate-lab.ps1 -ResourceGroup "rg-aumlab" -SubscriptionId $subId
+```
+
+Expected output:
+
+```
+=== Azure Update Manager Compliance Validation ===
+[PASS] DC01 -- Critical missing: 0 | Other: 1 | Status: Succeeded
+[PASS] WS01 -- Critical missing: 0 | Other: 1 | Status: Succeeded
+[PASS] WS02 -- Critical missing: 0 | Other: 1 | Status: Succeeded
+
+Overall: ALL PASS
+Report exported: aum-compliance-report.json
+```
+
+> **What the results mean:**
+> - **Critical missing: 0** — no Critical or Security patches outstanding. Lab validated.
+> - **Other: 1** — one non-critical patch available. Normal on fresh VMs, not required for compliance.
+> - **Status: Succeeded** — assessment completed cleanly.
+> - **FAIL with Critical missing > 0** — assessment is working correctly and found outstanding patches. This is expected behavior on brand-new VMs. Apply patches via the maintenance window and re-run to confirm.
+
+The exported `aum-compliance-report.json` contains structured data per VM including assessment status, patch counts, and timestamps — ready to feed a SIEM, open tickets in ServiceNow, or archive in Blob Storage for audit history.
+
+---
+
+## Step 4 — Portal Verification (Optional)
+
+Confirm everything is wired up correctly in the Azure Portal:
+
+| Check | Where to look |
+|-------|--------------|
+| All 3 VMs show as Assessed | Azure Update Manager → Machines |
+| aum-weekly-patches linked to all 3 VMs | Azure Update Manager → Maintenance Configurations |
+| Policy applied to rg-aumlab | Policy → Assignments |
+
+---
+
+## Teardown
+
+```powershell
+terraform destroy -auto-approve
+
+# Confirm the resource group is gone
+az group show --name rg-aumlab 2>&1
+# Expected: ResourceGroupNotFound
+```
+
+Only delete the state storage account when you are done with **all** labs that use it:
+
+```powershell
+az group delete -n RG-TerraformState --yes --no-wait
+```
+
+---
+
+## Troubleshooting
+
+| Problem | Why it happens | Fix |
+|---------|---------------|-----|
+| `Too many command line arguments` on terraform plan | PowerShell splits on `=` in unquoted flags | Use `terraform plan -out="aum-lab.tfplan"` (quoted) |
+| `Backend initialization required` | Backend config changed or new session | Run `terraform init -reconfigure` |
+| Wrong content in module folder | File written to wrong path during setup | Run `Select-String 'variable' modules\keyvault\main.tf \| Select-Object -First 1` — if it shows `subnet_id` the compute content is in the wrong folder. Overwrite with correct content. |
+| `403 Forbidden` on Key Vault secret | `enable_rbac_authorization` missing | Confirm `enable_rbac_authorization = true` is in `modules/keyvault/main.tf`. Re-run apply. |
+| `SkuNotAvailable: Standard_B2s` | Capacity restrictions in eastus | Use `Standard_D2s_v3` — already set in this lab's compute module |
+| `400 ResourceIdentityRequired` on policy | Modify-effect policies require a managed identity | The update-manager module includes `identity { type = "SystemAssigned" }` — if you see this your module has outdated content |
+| `400 Patch orchestration mode is not set` | VMs missing `patch_mode = AutomaticByPlatform` | The compute module sets this on all three VMs — if you see this your module has outdated content |
+| `start_date_time` error during plan | Date in `update-manager/main.tf` is in the past | Update to any future date: `"YYYY-MM-DD HH:MM"` |
+| Assessment returns `ResourceGroupNotFound` | `$subId` variable was empty | Run `$subId = az account show --query id -o tsv` then `echo $subId` to confirm it printed a GUID |
+| `ConvertFrom-Json: Unexpected character 'A'` | `az vm assess-patches` outputting a table, not JSON | Ensure `-o json` flag is in the script — the `validate-lab.ps1` in this repo already includes it |
+| DC01 extension fails or times out | AD promotion failure or Azure timeout | Re-run `terraform apply` — Terraform retries only what failed |
+| WS01/WS02 domain join fails | DC01 took longer than expected to promote | Re-run `terraform apply` — the join script waits for DNS resolution before attempting `Add-Computer` |
+
+---
+
+## Project Structure
+
+```
+azure-update-manager-lab/
+├── backend.tf                        # Remote state configuration
+├── versions.tf                       # Provider version requirements
+├── variables.tf                      # All input variables
+├── main.tf                           # Root module — wires all 4 child modules
+├── outputs.tf                        # VM public IPs and Key Vault name
+├── terraform.tfvars.example          # Safe template — commit this
+├── terraform.tfvars                  # Your real values — DO NOT commit
+├── .gitignore
+├── modules/
+│   ├── networking/main.tf            # VNet, subnet, NSG, NSG-subnet association
+│   ├── keyvault/main.tf              # Key Vault (RBAC model) + admin password secret
+│   ├── compute/main.tf               # 3 VMs, DC promotion, domain join extensions
+│   └── update-manager/main.tf       # Azure Policy + Maintenance Config + 3 Assignments
+└── scripts/
+    └── validate-lab.ps1              # Compliance validation + JSON report export
+```
+
+---
+
+## License
+
+MIT 
